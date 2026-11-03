@@ -144,3 +144,30 @@ def test_strict_types_reject_coercion(client, seeded):
     assert r.status_code == 422 and error_code(r) == "validation_error"
     r = client.post("/appointments", json=body(start_at=1893920400))  # epoch number
     assert r.status_code == 422 and error_code(r) == "validation_error"
+
+
+def test_idempotency_key_replays_201(client, seeded):
+    oil = body(service_type_id=1)
+    first = client.post("/appointments", json=oil, headers={"Idempotency-Key": "abc-123"})
+    again = client.post("/appointments", json=oil, headers={"Idempotency-Key": "abc-123"})
+    assert first.status_code == again.status_code == 201
+    assert again.json() == first.json()
+    assert again.headers["Idempotent-Replayed"] == "true"
+    assert "Idempotent-Replayed" not in first.headers
+
+
+def test_idempotency_key_reused_with_other_body_422(client, seeded):
+    client.post("/appointments", json=body(service_type_id=1), headers={"Idempotency-Key": "k"})
+    r = client.post("/appointments", json=body(service_type_id=2), headers={"Idempotency-Key": "k"})
+    assert r.status_code == 422 and error_code(r) == "idempotency_key_reused"
+
+
+def test_idempotency_key_invalid_422(client, seeded):
+    for bad in ("x" * 256, "has space"):
+        r = client.post("/appointments", json=body(), headers={"Idempotency-Key": bad})
+        assert r.status_code == 422 and error_code(r) == "validation_error", bad
+
+
+def test_openapi_documents_idempotency_header(client):
+    params = client.get("/openapi.json").json()["paths"]["/appointments"]["post"]["parameters"]
+    assert any(p["name"] == "Idempotency-Key" and p["in"] == "header" for p in params)

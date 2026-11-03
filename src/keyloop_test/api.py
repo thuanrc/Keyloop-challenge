@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
@@ -6,17 +8,19 @@ from zoneinfo import ZoneInfo
 
 import prometheus_client
 import sqlalchemy.exc
-from fastapi import Depends, FastAPI, Path, Query, Request
+from fastapi import Depends, FastAPI, Header, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from keyloop_test.booking import BookingError, BookingRequest, NotFound, book_appointment
+from keyloop_test.booking import (
+    BookingError, BookingRequest, NotFound, book_appointment, book_idempotently,
+)
 from keyloop_test.db import engine, get_session, init_db
 from keyloop_test.observability import (
-    BOOKED, REJECTED, RETRIES, ObservabilityMiddleware, configure_logging,
+    BOOKED, REJECTED, REPLAYED, RETRIES, ObservabilityMiddleware, configure_logging,
 )
 from keyloop_test.models import Appointment, Dealership
 from keyloop_test.schemas import (
@@ -75,10 +79,30 @@ def _db_unavailable(_: Request, e: Exception):
 
 @app.post("/appointments", status_code=201, response_model=AppointmentOut,
           responses=_errors(404, 409))
-def create_appointment(body: AppointmentCreate, session: SessionDep):
+def create_appointment(
+    body: AppointmentCreate,
+    session: SessionDep,
+    response: Response,
+    idempotency_key: Annotated[str | None, Header(
+        alias="Idempotency-Key", min_length=1, max_length=255, pattern=r"^[!-~]+$",
+        description="Optional. Retrying with the same key and body returns the original "
+                    "appointment instead of booking again.",
+    )] = None,
+):
+    req = BookingRequest(**body.model_dump())
     try:
-        appointment = book_appointment(session, BookingRequest(**body.model_dump()),
-                                       on_retry=RETRIES.inc)
+        if idempotency_key is None:
+            appointment = book_appointment(session, req, on_retry=RETRIES.inc)
+        else:
+            request_hash = hashlib.sha256(
+                json.dumps(body.model_dump(mode="json"), sort_keys=True).encode()).hexdigest()
+            appointment, replayed = book_idempotently(
+                session, req, idempotency_key, request_hash, on_retry=RETRIES.inc)
+            if replayed:
+                REPLAYED.inc()
+                response.headers["Idempotent-Replayed"] = "true"
+                log.info("appointment_replayed", extra={"appointment_id": appointment.id})
+                return appointment
     except BookingError as e:
         REJECTED.labels(e.code).inc()
         log.info("appointment_rejected", extra={"reason": e.code, **body.model_dump(mode="json")})

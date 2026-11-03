@@ -52,7 +52,8 @@ uv run pytest -v
 | `test_rules.py` | duration, not-in-past, business hours across time zones and DST (no DB) |
 | `test_constraints.py` | the database itself rejects overlapping bookings, cross-dealership resources and invalid intervals; back-to-back bookings are allowed |
 | `test_booking.py` | allocation (skill match, fallback, dealership scoping), every error path, retry after a lost race, **two truly concurrent requests → exactly one booking** |
-| `test_api.py` | HTTP status codes, error shape, time-zone handling, 503 on DB failure |
+| `test_idempotency.py` | `Idempotency-Key`: a retry replays without re-booking, key reuse with another body is rejected, a failed attempt doesn't consume the key, **two concurrent same-key requests → one booking** |
+| `test_api.py` | HTTP status codes, error shape, time-zone handling, 503 on DB failure, idempotency header |
 | `test_observability.py` | request-id propagation, JSON logs without PII, metrics |
 | `test_seed.py` | seed command is idempotent |
 
@@ -83,16 +84,24 @@ curl -X POST localhost:8000/appointments -H 'content-type: application/json' \
 curl -X POST localhost:8000/appointments -H 'content-type: application/json' \
   -d '{"vehicle_id":1,"service_type_id":1,"dealership_id":1,"start_at":"2030-01-07T09:00:00"}'
 
-# 5. Read back
+# 5. Safe retry: send the same request twice with one Idempotency-Key.
+#    The second call returns the SAME appointment (header Idempotent-Replayed: true) instead of
+#    booking again. Without the key, a retry of this oil change would book Bob as well.
+curl -i -X POST localhost:8000/appointments -H 'content-type: application/json' \
+  -H 'Idempotency-Key: 7f3c9a2e-retry-demo' \
+  -d '{"vehicle_id":1,"service_type_id":1,"dealership_id":1,"start_at":"2030-01-08T09:00:00+00:00"}'
+
+# 6. Read back
 curl localhost:8000/appointments/1
 curl "localhost:8000/appointments?dealership_id=1&date=2030-01-07"
 
-# 6. Operations
+# 7. Operations
 curl localhost:8000/health/ready
 curl localhost:8000/metrics | grep appointment
 ```
 
-Error codes: `not_found` 404 · `validation_error`, `start_in_past`, `outside_business_hours` 422 ·
+Error codes: `not_found` 404 · `validation_error`, `start_in_past`, `outside_business_hours`,
+`idempotency_key_reused` 422 ·
 `no_technician_available`, `no_bay_available`, `slot_taken` 409 · `internal_error` 500 ·
 `service_unavailable` 503. All errors share one shape: `{"error": {"code": ..., "message": ...}}`.
 

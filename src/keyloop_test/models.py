@@ -91,3 +91,16 @@ class Appointment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class IdempotencyKey(Base):
+    """Client-supplied key → the appointment its first successful request created."""
+
+    __tablename__ = "idempotency_keys"
+    # shortcut: keys never expire; add a TTL cleanup (e.g. delete rows older than 24 h) when volume grows
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    request_hash: Mapped[str] = mapped_column(Text)
+    appointment_id: Mapped[int | None] = mapped_column(ForeignKey("appointments.id"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

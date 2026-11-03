@@ -43,6 +43,8 @@ The brief is ambiguous in places; these are the decisions taken.
     every row blocks its resources.
 11. **Service bays are interchangeable** within a dealership: any bay can host any service type.
     Bay capabilities (e.g. EV lift) are future work and would mirror the technician-skill match.
+12. **Idempotency keys are global and never expire** (there's no auth, so no per-client scoping).
+    Clients should use random UUIDs. Only successful bookings are remembered.
 
 ## 3. Architecture
 
@@ -89,6 +91,7 @@ erDiagram
     APPOINTMENT }o--|| SERVICE_TYPE : of
     APPOINTMENT }o--|| TECHNICIAN : assigned
     APPOINTMENT }o--|| SERVICE_BAY : in
+    IDEMPOTENCY_KEY |o--o| APPOINTMENT : "first result of"
 
     DEALERSHIP {
         int id PK
@@ -140,6 +143,12 @@ erDiagram
         tstzrange period "generated, half-open"
         timestamptz created_at
     }
+    IDEMPOTENCY_KEY {
+        text key PK
+        text request_hash "sha256 of the request body"
+        int appointment_id FK
+        timestamptz created_at
+    }
 ```
 
 **Key constraints on `appointments`:**
@@ -164,7 +173,7 @@ context (skill match, business hours, not in the past) live in the booking servi
 
 | Method & path | Purpose | Responses |
 |---|---|---|
-| `POST /appointments` | Check availability and book atomically | `201` Appointment · `404` unknown vehicle/service type/dealership · `409` no capacity · `422` invalid input / rule violation |
+| `POST /appointments` | Check availability and book atomically. Optional `Idempotency-Key` header (see below) | `201` Appointment · `404` unknown vehicle/service type/dealership · `409` no capacity · `422` invalid input / rule violation / key reused |
 | `GET /appointments/{id}` | Fetch one appointment | `200` · `404` |
 | `GET /appointments?dealership_id=&date=` | List a dealership's appointments for a local date (both params required) | `200` · `422` |
 | `GET /health/live` | Liveness: the process is up (no DB call) | `200` |
@@ -197,12 +206,36 @@ POST /appointments
 | `code` | HTTP |
 |---|---|
 | `not_found` | 404 |
-| `validation_error`, `start_in_past`, `outside_business_hours` | 422 |
+| `validation_error`, `start_in_past`, `outside_business_hours`, `idempotency_key_reused` | 422 |
 | `no_technician_available`, `no_bay_available`, `slot_taken` | 409 |
 | `service_unavailable` (DB pool/lock/statement/connect timeout, DB down) | 503 |
 | `internal_error` (unexpected bug; logged with the request id, no internals in the body) | 500 |
 
 Every route documents these responses with the `ErrorResponse` schema in the generated OpenAPI spec.
+
+### Idempotent retries (`Idempotency-Key`)
+
+**Problem:** a client that times out and resends a booking would otherwise book *again*. The
+first request took Alice, so the retry quietly takes Bob, and one car ends up with two
+appointments at the same time.
+
+**Contract:** `POST /appointments` accepts an optional `Idempotency-Key` header (1–255 printable
+ASCII characters, e.g. a UUID).
+
+| Situation | Result |
+|---|---|
+| New key | Booked normally, and the key is linked to the new appointment |
+| Same key, same body | `201` with the **original** appointment and the header `Idempotent-Replayed: true`. Nothing new is booked |
+| Same key, different body | `422 idempotency_key_reused` |
+| Same key, first request **failed** (409/422/404) | Nothing was stored, so the retry is a fresh attempt |
+| Same key, two requests **at the same time** | The second waits until the first commits, then replays its result. Exactly one booking |
+
+**How:** the key row is claimed with `INSERT … ON CONFLICT DO NOTHING` as the first statement of
+the booking transaction. It's linked to the appointment just before the same `COMMIT`, so the key
+and the booking are always written together or not at all. A concurrent request with the same
+key blocks on the primary key instead of racing. The stored value is the appointment id, not a
+response copy, so a replay can never disagree with the database. The body is compared through a
+SHA-256 hash of its canonical JSON.
 
 > **Why no separate `GET /availability` endpoint?** An availability answer is stale the
 > moment it is returned (time-of-check vs time-of-use). The requirement "check before
@@ -271,9 +304,9 @@ Two clients can see the same technician as free at the same moment. Options cons
 
 | Pillar | Implementation |
 |---|---|
-| **Logging** | JSON lines on stdout: `ts, level, msg, request_id, method, path, status, duration_ms`. Domain events: `appointment_booked` (ids, start/end) and `appointment_rejected` (reason). No customer PII (only ids) in logs. |
+| **Logging** | JSON lines on stdout: `ts, level, msg, request_id, method, path, status, duration_ms`. Domain events: `appointment_booked` (ids, start/end), `appointment_rejected` (reason) and `appointment_replayed` (idempotent retry). No customer PII (only ids) in logs. |
 | **Correlation** | `X-Request-ID` accepted from the caller or generated (uuid4), stored in a `contextvar`, included in every log line, and echoed in the response header. |
-| **Metrics** | `appointments_booked_total`; `appointment_booking_rejected_total{reason}`; `appointment_booking_retries_total`; `http_request_duration_seconds{method,route,status}` histogram. These give booking success rate, contention rate (retries), and latency SLOs (p95 < 300 ms target). |
+| **Metrics** | `appointments_booked_total`; `appointment_booking_rejected_total{reason}`; `appointment_booking_retries_total`; `appointment_idempotent_replays_total`; `http_request_duration_seconds{method,route,status}` histogram. These give booking success rate, contention rate (retries), client retry rate (replays), and latency SLOs (p95 < 300 ms target). |
 | **Health** | `/health/live` (process only) for liveness probes. `/health/ready` (DB ping) for readiness, so a DB outage takes replicas out of rotation instead of restart-looping them. |
 | **Tracing (designed, not built)** | OpenTelemetry auto-instrumentation for FastAPI + SQLAlchemy, exporting OTLP to Jaeger/Tempo. The request id would become a span attribute. Not built because a single service with one DB hop gains little from traces today. |
 
@@ -296,8 +329,9 @@ request that loses a race usually ends as `no_technician_available` after retryi
   waits on the winner's row lock until that transaction ends; `lock_timeout=2s` and
   `statement_timeout=5s` (set per connection) cap that wait, and `connect_timeout=3s` stops an
   unreachable DB host from hanging new connections (measured: >90 s without it). Bounded retries (3) mean no unbounded
-  loops. Health endpoints support orchestration. Future: an `Idempotency-Key` header so that client
-  retries after a timeout don't create duplicate bookings.
+  loops. Health endpoints support orchestration. An `Idempotency-Key` header makes client
+  retries after a timeout safe: they replay the original booking instead of creating a second one
+  (§5).
 - **Maintainability:** layered modules (API → service → models). Pure rule functions are
   unit-tested. Stable error codes. The OpenAPI spec is the contract.
 - **Security:** Pydantic validation at the trust boundary; parameterised SQL only (ORM); no PII in
@@ -333,6 +367,7 @@ request that loses a race usually ends as `no_technician_available` after retryi
 | Constraint tests | the DB itself rejects overlaps, cross-dealership resources and bad intervals, and allows back-to-back bookings | yes |
 | Service tests | allocation (skill match, fallback, dealership scoping), every error path, retry after a lost race | yes |
 | Concurrency test | two truly simultaneous requests for the last slot → exactly one booking | yes |
+| Idempotency tests | same key replays without re-booking, key reuse with another body is rejected, a failed attempt doesn't consume the key, two concurrent same-key requests → one booking | yes |
 | API tests | status codes, error shape, timezone handling, request id, metrics | yes |
 
 Integration tests run against real PostgreSQL (Docker), not SQLite or mocks, because the
@@ -341,6 +376,7 @@ central guarantee is a Postgres feature.
 ## 12. Future Work
 
 Cancellation/rescheduling (add `status`, make constraints partial `WHERE status = 'confirmed'`) ·
-free-slot search endpoint · `Idempotency-Key` · per-day opening hours and holidays · technician
+free-slot search endpoint · expiry for idempotency keys (TTL cleanup, e.g. 24 h) · a per-vehicle
+overlap constraint, so even retries *without* a key can't double-book a car · per-day opening hours and holidays · technician
 shifts/breaks · load-balanced allocation · authentication and dealership scoping · OpenTelemetry
 tracing · Alembic migrations (replacing `create_all`).

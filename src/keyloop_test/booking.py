@@ -5,11 +5,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import any_, exists, literal, select
+from sqlalchemy import any_, exists, literal, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from keyloop_test.models import Appointment, Dealership, ServiceBay, ServiceType, Technician, Vehicle
+from keyloop_test.models import (
+    Appointment, Dealership, IdempotencyKey, ServiceBay, ServiceType, Technician, Vehicle,
+)
 
 MAX_ATTEMPTS = 3
 
@@ -45,6 +48,10 @@ class NoBayAvailable(BookingError):
 
 class SlotTaken(BookingError):
     code, status = "slot_taken", 409
+
+
+class IdempotencyKeyReused(BookingError):
+    code, status = "idempotency_key_reused", 422
 
 
 def compute_end(start_at: datetime, duration_minutes: int) -> datetime:
@@ -99,6 +106,7 @@ def book_appointment(
     now: datetime | None = None,
     *,
     on_retry: Callable[[], None] | None = None,
+    on_booked: Callable[[Appointment], None] | None = None,
 ) -> Appointment:
     try:
         vehicle = _get(session, Vehicle, req.vehicle_id)
@@ -148,9 +156,43 @@ def book_appointment(
                 if on_retry:
                     on_retry()  # lost a race to a concurrent booking; re-query
                 continue
+            if on_booked:
+                on_booked(appointment)  # runs inside the booking transaction, before commit
             session.commit()
             return appointment
         raise SlotTaken("Resources were taken by a concurrent booking; please retry")
     except BookingError:
         session.rollback()
         raise
+
+
+def book_idempotently(
+    session: Session,
+    req: BookingRequest,
+    key: str,
+    request_hash: str,
+    now: datetime | None = None,
+    *,
+    on_retry: Callable[[], None] | None = None,
+) -> tuple[Appointment, bool]:
+    """Book once per key. Returns (appointment, replayed)."""
+    # Claim the key in the booking's transaction. A concurrent request with the same key blocks
+    # on the primary key until this one commits (then replays) or rolls back (then books).
+    claimed = session.execute(
+        insert(IdempotencyKey).values(key=key, request_hash=request_hash)
+        .on_conflict_do_nothing().returning(IdempotencyKey.key)
+    ).first()
+    if claimed is None:
+        existing = session.get(IdempotencyKey, key)
+        session.rollback()
+        if existing.request_hash != request_hash:
+            raise IdempotencyKeyReused(
+                "Idempotency-Key was already used with a different request body")
+        return session.get(Appointment, existing.appointment_id), True
+
+    def link(appointment: Appointment) -> None:
+        session.execute(update(IdempotencyKey).where(IdempotencyKey.key == key)
+                        .values(appointment_id=appointment.id))
+
+    # a failed booking rolls back the claim too, so the client can retry with the same key
+    return book_appointment(session, req, now, on_retry=on_retry, on_booked=link), False

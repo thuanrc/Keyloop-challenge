@@ -16,6 +16,7 @@ request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
 BOOKED = Counter("appointments_booked", "Appointments successfully booked")
 REJECTED = Counter("appointment_booking_rejected", "Booking requests rejected", ["reason"])
 RETRIES = Counter("appointment_booking_retries", "Bookings retried after losing a race")
+REPLAYED = Counter("appointment_idempotent_replays", "Requests answered from an Idempotency-Key")
 HTTP_LATENCY = Histogram("http_request_duration_seconds", "HTTP request latency",
                          ["method", "route", "status"])
 
