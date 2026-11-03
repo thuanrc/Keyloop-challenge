@@ -61,3 +61,28 @@ def test_json_log_has_request_id(client, seeded):
 def test_metrics_served_without_redirect(client):
     r = client.get("/metrics", follow_redirects=False)
     assert r.status_code == 200 and "appointments_booked_total" in r.text
+
+
+def test_unknown_http_method_label_is_bounded(client):
+    client.request("FOOBAR", "/health/live")
+    assert sample("http_request_duration_seconds_count", method="FOOBAR",
+                  route="/health/live", status="405") == 0
+    assert sample("http_request_duration_seconds_count", method="other",
+                  route="/health/live", status="405") >= 1
+
+
+def test_unhandled_error_logged_with_request_id(client, seeded, monkeypatch):
+    monkeypatch.setattr("keyloop_test.api.book_appointment",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(JsonFormatter())
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        client.post("/appointments", json=BODY, headers={"X-Request-ID": "err-2"})
+    finally:
+        root.removeHandler(handler)
+    lines = [json.loads(line) for line in buf.getvalue().splitlines()]
+    err = next(line for line in lines if line["msg"] == "unhandled_error")
+    assert err["request_id"] == "err-2" and "RuntimeError" in err["exc"]

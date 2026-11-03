@@ -6,11 +6,12 @@ from zoneinfo import ZoneInfo
 
 import prometheus_client
 import sqlalchemy.exc
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from keyloop_test.booking import BookingError, BookingRequest, NotFound, book_appointment
 from keyloop_test.db import engine, get_session, init_db
@@ -18,7 +19,7 @@ from keyloop_test.observability import (
     BOOKED, REJECTED, RETRIES, ObservabilityMiddleware, configure_logging,
 )
 from keyloop_test.models import Appointment, Dealership
-from keyloop_test.schemas import AppointmentCreate, AppointmentOut
+from keyloop_test.schemas import MAX_DATE, MAX_ID, AppointmentCreate, AppointmentOut
 
 log = logging.getLogger("keyloop_test.api")
 
@@ -43,6 +44,12 @@ def _error(status: int, code: str, message: str) -> JSONResponse:
 @app.exception_handler(BookingError)
 def _booking_error(_: Request, e: BookingError):
     return _error(e.status, e.code, e.message)
+
+
+@app.exception_handler(StarletteHTTPException)
+def _http_error(_: Request, e: StarletteHTTPException):
+    code = {404: "not_found", 405: "method_not_allowed"}.get(e.status_code, "http_error")
+    return _error(e.status_code, code, str(e.detail))
 
 
 @app.exception_handler(RequestValidationError)
@@ -78,7 +85,7 @@ def create_appointment(body: AppointmentCreate, session: SessionDep):
 
 
 @app.get("/appointments/{appointment_id}", response_model=AppointmentOut)
-def get_appointment(appointment_id: int, session: SessionDep):
+def get_appointment(appointment_id: Annotated[int, Path(gt=0, le=MAX_ID)], session: SessionDep):
     appointment = session.get(Appointment, appointment_id)
     if appointment is None:
         raise NotFound(f"Appointment {appointment_id} not found")
@@ -87,7 +94,9 @@ def get_appointment(appointment_id: int, session: SessionDep):
 
 @app.get("/appointments", response_model=list[AppointmentOut])
 def list_appointments(
-    session: SessionDep, dealership_id: Annotated[int, Query()], date: Annotated[date, Query()]
+    session: SessionDep,
+    dealership_id: Annotated[int, Query(gt=0, le=MAX_ID)],
+    date: Annotated[date, Query(lt=MAX_DATE)],
 ):
     dealership = session.get(Dealership, dealership_id)
     if dealership is None:

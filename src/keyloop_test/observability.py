@@ -47,6 +47,10 @@ def configure_logging(level: str | None = None) -> None:
 
 
 access_log = logging.getLogger("keyloop_test.access")
+_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+_INTERNAL_ERROR = json.dumps(
+    {"error": {"code": "internal_error", "message": "Unexpected server error"}}
+).encode()
 
 
 class ObservabilityMiddleware:
@@ -61,21 +65,30 @@ class ObservabilityMiddleware:
         headers = dict(scope["headers"])
         rid = headers.get(b"x-request-id", b"").decode("latin-1") or uuid.uuid4().hex
         token = request_id_var.set(rid)
-        status, started = 500, time.perf_counter()
+        status, started, response_started = 500, time.perf_counter(), False
 
         async def send_with_id(message):
-            nonlocal status
+            nonlocal status, response_started
             if message["type"] == "http.response.start":
-                status = message["status"]
+                status, response_started = message["status"], True
                 message.setdefault("headers", []).append((b"x-request-id", rid.encode("latin-1")))
             await send(message)
 
         try:
             await self.app(scope, receive, send_with_id)
+        except Exception:
+            # log while the request id is still set; ServerErrorMiddleware sits outside us
+            access_log.exception("unhandled_error")
+            if response_started:
+                raise
+            await send_with_id({"type": "http.response.start", "status": 500,
+                                "headers": [(b"content-type", b"application/json")]})
+            await send_with_id({"type": "http.response.body", "body": _INTERNAL_ERROR})
         finally:
             elapsed = time.perf_counter() - started
             route = getattr(scope.get("route"), "path", "unmatched")
-            HTTP_LATENCY.labels(scope["method"], route, str(status)).observe(elapsed)
+            method = scope["method"] if scope["method"] in _METHODS else "other"
+            HTTP_LATENCY.labels(method, route, str(status)).observe(elapsed)
             access_log.info("request", extra={"method": scope["method"], "path": scope["path"],
                                               "status": status,
                                               "duration_ms": round(elapsed * 1000, 1)})
