@@ -9,3 +9,5 @@ wheels/
 # Virtual environments
 .venv
 docs/superpowers/*
+# Plan-execution workspace
+.superpowers/

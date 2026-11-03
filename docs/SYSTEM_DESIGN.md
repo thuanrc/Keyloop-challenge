@@ -18,7 +18,7 @@ are both free for the **entire service duration**, and persists the result.
 | 2. Real-time availability check | Inside the same DB transaction as the insert: find a free qualified technician + free bay; PostgreSQL exclusion constraints make double-booking impossible even under concurrency |
 | 3. Confirmed appointment record | `appointments` row linking customer, vehicle, technician, service bay, service type, dealership |
 
-**Out of scope (deliberately not built — see §11 Future Work)**
+**Out of scope (deliberately not built — see §12 Future Work)**
 Authentication, cancellation/rescheduling, a "find me free slots" search, customer/vehicle
 CRUD (seeded instead), notifications, frontend UI.
 
@@ -41,6 +41,8 @@ The brief is ambiguous in places; these are the decisions taken.
 9. **No booking in the past.**
 10. Every appointment is confirmed at creation (no pending/hold state, no cancellation yet), so
     every row blocks its resources.
+11. **Service bays are interchangeable** within a dealership: any bay can host any service type.
+    Bay capabilities (e.g. EV lift) are future work and would mirror the technician-skill match.
 
 ## 3. Architecture
 
@@ -148,9 +150,15 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 CHECK (end_at > start_at)
 CONSTRAINT no_technician_overlap EXCLUDE USING gist (technician_id WITH =, period WITH &&)
 CONSTRAINT no_bay_overlap        EXCLUDE USING gist (service_bay_id WITH =, period WITH &&)
+-- resources must belong to the appointment's dealership (technicians/service_bays have UNIQUE (id, dealership_id))
+FOREIGN KEY (technician_id, dealership_id)  REFERENCES technicians (id, dealership_id)
+FOREIGN KEY (service_bay_id, dealership_id) REFERENCES service_bays (id, dealership_id)
 ```
 
 The GiST indexes behind these constraints also make the "is this resource busy?" lookups fast.
+Every invariant that can be stated declaratively (no overlap, same dealership, valid interval)
+lives in the database, so a future bug or a second writer can't break it. Rules that need
+context (skill match, business hours, not in the past) live in the booking service.
 
 ## 5. API Contract
 
@@ -158,8 +166,9 @@ The GiST indexes behind these constraints also make the "is this resource busy?"
 |---|---|---|
 | `POST /appointments` | Check availability and book atomically | `201` Appointment · `404` unknown vehicle/service type/dealership · `409` no capacity · `422` invalid input / rule violation |
 | `GET /appointments/{id}` | Fetch one appointment | `200` · `404` |
-| `GET /appointments?dealership_id=&date=` | List a dealership's appointments for a local date | `200` |
-| `GET /health` | Liveness + DB ping | `200` / `503` |
+| `GET /appointments?dealership_id=&date=` | List a dealership's appointments for a local date (both params required) | `200` · `422` |
+| `GET /health/live` | Liveness: the process is up (no DB call) | `200` |
+| `GET /health/ready` | Readiness: DB reachable (`SELECT 1`) | `200` / `503` |
 | `GET /metrics` | Prometheus metrics | `200` |
 | `GET /docs`, `/openapi.json` | Generated OpenAPI contract | `200` |
 
@@ -190,6 +199,7 @@ POST /appointments
 | `not_found` | 404 |
 | `validation_error`, `start_in_past`, `outside_business_hours` | 422 |
 | `no_technician_available`, `no_bay_available`, `slot_taken` | 409 |
+| `service_unavailable` (DB pool/lock/statement timeout, DB down) | 503 |
 
 > **Why no separate `GET /availability` endpoint?** An availability answer is stale the
 > moment it is returned (time-of-check vs time-of-use). The requirement "check before
@@ -261,10 +271,13 @@ Two clients can see the same technician as free at the same moment. Options cons
 | **Logging** | JSON lines on stdout: `ts, level, msg, request_id, method, path, status, duration_ms`. Domain events: `appointment_booked` (ids, start/end) and `appointment_rejected` (reason). No customer PII (only ids) in logs. |
 | **Correlation** | `X-Request-ID` accepted from the caller or generated (uuid4), stored in a `contextvar`, included in every log line, and echoed in the response header. |
 | **Metrics** | `appointments_booked_total`; `appointment_booking_rejected_total{reason}`; `appointment_booking_retries_total`; `http_request_duration_seconds{method,route,status}` histogram. These give booking success rate, contention rate (retries), and latency SLOs (p95 < 300 ms target). |
-| **Health** | `GET /health` pings the DB; used for container/k8s liveness and readiness. |
+| **Health** | `/health/live` (process only) for liveness probes. `/health/ready` (DB ping) for readiness, so a DB outage takes replicas out of rotation instead of restart-looping them. |
 | **Tracing (designed, not built)** | OpenTelemetry auto-instrumentation for FastAPI + SQLAlchemy, exporting OTLP to Jaeger/Tempo. The request id would become a span attribute. Not built because a single service with one DB hop gains little from traces today. |
 
-Suggested alerts: rejection rate for `slot_taken` > 5% (contention), p95 latency > 300 ms, `/health` failing.
+Suggested alerts: `rate(appointment_booking_retries_total)` / booking rate > 5% (contention: a
+request that loses a race usually ends as `no_technician_available` after retrying, not as
+`slot_taken`), p95 latency > 300 ms, `/health/ready` failing. Business signal: a rising
+`no_*_available` rejection share means a dealership is short of capacity.
 
 ## 9. Non-Functional Considerations
 
@@ -272,11 +285,15 @@ Suggested alerts: rejection rate for `slot_taken` > 5% (contention), p95 latency
   coordination happens in Postgres via constraints, so no distributed lock is needed. Contention is
   per technician/bay and therefore naturally sharded by dealership. If it grows, partition
   `appointments` by dealership and add read replicas for the `GET` endpoints.
-- **Performance:** one transaction per booking, ~5 indexed queries. GiST indexes serve the overlap
-  lookups. A connection pool (SQLAlchemy defaults) is used.
-- **Reliability:** correctness is enforced by the DB, not app memory. Bounded retries (3) mean no
-  unbounded loops. `/health` supports orchestration. Future: an `Idempotency-Key` header so that
-  client retries after a timeout don't create duplicate bookings.
+- **Performance:** one short transaction per booking, ~5 indexed queries. GiST indexes serve the
+  overlap lookups. The SQLAlchemy pool is sized via env (`DB_POOL_SIZE`, default 10, overflow 10).
+  This matters because sync FastAPI endpoints run on a 40-thread pool; requests beyond the pool
+  wait up to `pool_timeout` (5 s) and then fail fast with 503 instead of hanging.
+- **Reliability:** correctness is enforced by the DB, not app memory. A request that loses a race
+  waits on the winner's row lock until that transaction ends; `lock_timeout=2s` and
+  `statement_timeout=5s` (set per connection) cap that wait. Bounded retries (3) mean no unbounded
+  loops. Health endpoints support orchestration. Future: an `Idempotency-Key` header so that client
+  retries after a timeout don't create duplicate bookings.
 - **Maintainability:** layered modules (API → service → models). Pure rule functions are
   unit-tested. Stable error codes. The OpenAPI spec is the contract.
 - **Security:** Pydantic validation at the trust boundary; parameterised SQL only (ORM); no PII in
@@ -285,21 +302,39 @@ Suggested alerts: rejection rate for `slot_taken` > 5% (contention), p95 latency
 
 ## 10. How GenAI Was Used in Design
 
-*(Author: refine this with your own words and specific moments before submitting.)*
+> **TODO(author):** the bullets below record what happened in the AI session. Items marked
+> ☐ are verification steps that only count once *you* have done them. Do them, then rewrite
+> the section in your own words.
 
 - **Scenario selection:** I asked an AI agent (Claude Code) to compare the four scenarios against
-  the evaluation criteria. It recommended A because it has the most real business logic and a
-  concurrency problem worth designing around. I agreed after checking that B and C are mostly CRUD.
-- **Design drafting:** the agent drafted this document and the implementation plan from my
-  direction (backend only, FastAPI + Postgres, minimal scope). I constrained scope explicitly:
-  no auth, no cancellation, no slot search.
-- **Challenging the AI:** the key decision, preventing double-booking, was reviewed against the
-  alternatives in §6. I verified the exclusion-constraint approach against PostgreSQL docs
-  (`btree_gist`, half-open `tstzrange`). The plan includes a test that proves the constraint fires
-  under truly concurrent requests, rather than trusting the claim.
-- **Assumptions:** the AI listed ambiguities; I chose the resolutions in §2.
+  the evaluation criteria. It recommended A for its real business logic and a concurrency problem
+  worth designing around; B and C are mostly CRUD.
+- **Directing scope:** I set the constraints (backend only, smallest version that meets the three
+  requirements). The agent drafted this document and a task-by-task, test-first implementation plan.
+- **Reviewing the AI's draft:** a second review pass over the AI's first draft found and fixed
+  real gaps: no DB-level guard against cross-dealership resources, a health check that would
+  restart-loop pods during a DB outage, an alert on a metric that would rarely fire, no lock or pool
+  timeouts, and a test fixture the plan referenced but never defined.
+- ☐ **Verify the core claim yourself:** read the PostgreSQL docs on exclusion constraints,
+  `btree_gist` and `tstzrange` bounds. The plan's DB-level and concurrent tests must pass before
+  this design is trusted.
+- ☐ **Assumptions:** confirm or change each resolution in §2. These are product decisions, and
+  you own them.
 
-## 11. Future Work
+## 11. Testing Strategy
+
+| Layer | What it proves | DB? |
+|---|---|---|
+| Rule unit tests | duration, not-in-past, business hours across timezones and DST | no |
+| Constraint tests | the DB itself rejects overlaps, cross-dealership resources and bad intervals, and allows back-to-back bookings | yes |
+| Service tests | allocation (skill match, fallback, dealership scoping), every error path, retry after a lost race | yes |
+| Concurrency test | two truly simultaneous requests for the last slot → exactly one booking | yes |
+| API tests | status codes, error shape, timezone handling, request id, metrics | yes |
+
+Integration tests run against real PostgreSQL (Docker), not SQLite or mocks, because the
+central guarantee is a Postgres feature.
+
+## 12. Future Work
 
 Cancellation/rescheduling (add `status`, make constraints partial `WHERE status = 'confirmed'`) ·
 free-slot search endpoint · `Idempotency-Key` · per-day opening hours and holidays · technician
