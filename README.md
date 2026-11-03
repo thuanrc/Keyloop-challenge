@@ -163,16 +163,13 @@ kept unedited in [`docs/PLAN.md`](docs/PLAN.md).
   against the evaluation criteria. I picked **Scenario A** because it has a real concurrency
   problem, where B and C are mostly CRUD. I kept the scope to the three requirements: no auth,
   cancellation or slot search.
-- **Spec → review → plan → code, in that order.** The agent first wrote the system design. I
+- **Spec → review → plan → code → test, in that order.** The agent first wrote the system design. I
   then had it **review its own design as a separate pass** before any code existed. Next came a
   task-by-task, test-first implementation plan with exact interfaces and test cases, and only then
   execution, with one commit per task.
 - **Keep decisions visible.** Wherever the agent deviated from the plan, it had to record the
   decision and its cost, so nothing changed silently.
-- **Stay in control of side effects.** When the agent hit a missing database (no Docker on my
-  machine), it stopped and asked instead of guessing. I installed Docker, and it continued. When
-  a later package swap (`httpx2`) was blocked by the permission system, I reviewed it and
-  approved it explicitly. Pushing and publishing stayed with me.
+- **Stay in control of side effects.** 
 
 ### Verification process
 
