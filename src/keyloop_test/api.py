@@ -2,7 +2,7 @@ import hashlib
 import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
@@ -94,8 +94,11 @@ def create_appointment(
         if idempotency_key is None:
             appointment = book_appointment(session, req, on_retry=RETRIES.inc)
         else:
+            # hash the instant in UTC, so "09:00Z" and "16:00+07:00" count as the same request
+            canonical = body.model_dump(mode="json") | {
+                "start_at": body.start_at.astimezone(UTC).isoformat()}
             request_hash = hashlib.sha256(
-                json.dumps(body.model_dump(mode="json"), sort_keys=True).encode()).hexdigest()
+                json.dumps(canonical, sort_keys=True).encode()).hexdigest()
             appointment, replayed = book_idempotently(
                 session, req, idempotency_key, request_hash, on_retry=RETRIES.inc)
             if replayed:

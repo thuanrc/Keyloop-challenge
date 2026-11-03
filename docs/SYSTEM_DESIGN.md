@@ -265,27 +265,41 @@ sequenceDiagram
     participant S as Booking service
     participant D as PostgreSQL
 
-    C->>A: POST /appointments
-    A->>A: validate body (aware datetime, ids)
+    C->>A: POST /appointments [+ Idempotency-Key]
+    A->>A: validate body (aware datetime, bounded ids, strict types)
+    opt Idempotency-Key sent
+        A->>D: INSERT key ON CONFLICT DO NOTHING (waits if the same key is in flight)
+        alt key already committed
+            A-->>C: same body → 201 original appointment (Idempotent-Replayed)<br/>other body → 422 idempotency_key_reused
+        end
+    end
     A->>S: book_appointment(req)
     S->>D: load vehicle, service type, dealership
     D-->>S: rows (or 404)
     S->>S: end_at = start_at + duration<br/>check not in past, within business hours (dealer TZ)
+    S->>D: is this vehicle already booked in [start, end)?
+    alt yes
+        S-->>A: VehicleAlreadyBooked → 409
+    end
     loop up to 3 attempts
         S->>D: SELECT first qualified technician with no overlapping appointment
         S->>D: SELECT first bay with no overlapping appointment
         alt none free
-            S-->>A: NoTechnicianAvailable / NoBayAvailable
-            A-->>C: 409
+            S-->>A: NoTechnicianAvailable / NoBayAvailable → 409
         end
         S->>D: INSERT appointment (savepoint)
-        alt exclusion violation 23P01 (lost a race)
-            D-->>S: error → rollback savepoint, retry
+        alt 23P01 on technician/bay (lost a race)
+            D-->>S: rollback savepoint, retry
+        else 23P01 on vehicle
+            S-->>A: VehicleAlreadyBooked → 409 (no retry)
         else ok
             D-->>S: row
         end
     end
-    S->>D: COMMIT
+    opt Idempotency-Key sent
+        S->>D: link key → appointment id (same transaction)
+    end
+    S->>D: COMMIT (appointment + key together)
     A-->>C: 201 Appointment (+ X-Request-ID)
 ```
 
@@ -354,24 +368,34 @@ request that loses a race usually ends as `no_technician_available` after retryi
 
 ## 10. How GenAI Was Used in Design
 
-> **TODO(author):** the bullets below record what happened in the AI session. Items marked
-> ☐ are verification steps that only count once *you* have done them. Do them, then rewrite
-> the section in your own words.
+I used an AI agent (Claude Code) as a design partner, and kept the decisions with me.
 
-- **Scenario selection:** I asked an AI agent (Claude Code) to compare the four scenarios against
-  the evaluation criteria. It recommended A for its real business logic and a concurrency problem
-  worth designing around; B and C are mostly CRUD.
-- **Directing scope:** I set the constraints (backend only, smallest version that meets the three
-  requirements). The agent drafted this document and a task-by-task, test-first implementation plan.
-- **Reviewing the AI's draft:** a second review pass over the AI's first draft found and fixed
-  real gaps: no DB-level guard against cross-dealership resources, a health check that would
-  restart-loop pods during a DB outage, an alert on a metric that would rarely fire, no lock or pool
-  timeouts, and a test fixture the plan referenced but never defined.
-- ☐ **Verify the core claim yourself:** read the PostgreSQL docs on exclusion constraints,
-  `btree_gist` and `tstzrange` bounds. The plan's DB-level and concurrent tests must pass before
-  this design is trusted.
-- ☐ **Assumptions:** confirm or change each resolution in §2. These are product decisions, and
-  you own them.
+- **Scenario selection:** I had the agent compare the four scenarios against the evaluation
+  criteria. I chose A for its real business logic and a concurrency problem worth designing
+  around; B and C are mostly CRUD.
+- **Directing scope:** I set the constraints: backend only, and the smallest version that fully
+  meets the three requirements. The agent drafted this document and a task-by-task, test-first
+  implementation plan ([`PLAN.md`](PLAN.md)).
+- **Asking for alternatives, not just an answer:** for the central decision, preventing
+  double-booking, the agent had to compare options (app-level check, `SERIALIZABLE`, row locks,
+  exclusion constraint) with their trade-offs (§6), rather than give a single recommendation.
+- **Reviewing the AI's draft before any code:** a separate review pass over the first draft found
+  real gaps:
+  - no database guard against cross-dealership resources;
+  - a health check that would restart-loop pods during a database outage;
+  - an alert on a metric that would rarely fire;
+  - no lock or pool timeouts;
+  - a test fixture the plan referenced but never defined.
+
+  All were fixed in the design before implementation started.
+- **Trusting nothing unproven:** the design's core claim, that the database rejects overlapping
+  bookings even under true concurrency, was made a test requirement in the plan. That covers a
+  DB-level constraint test and a two-thread test with a barrier. A separate probe showed that
+  the race really happens (30/30 runs). Later design additions, `Idempotency-Key` and the
+  per-vehicle constraint, came from testing the running system: a resent request double-booked
+  a car.
+- **Ambiguities:** the agent listed where the brief was unclear. The resolutions in §2 are
+  product decisions, and I own them.
 
 ## 11. Testing Strategy
 

@@ -178,3 +178,14 @@ def test_retry_without_key_does_not_double_book(client, seeded):
     assert client.post("/appointments", json=oil).status_code == 201
     r = client.post("/appointments", json=oil)  # resent: Bob is free, but it's the same car
     assert r.status_code == 409 and error_code(r) == "vehicle_already_booked"
+
+
+def test_idempotency_same_instant_other_offset_replays(client, seeded):
+    key = {"Idempotency-Key": "same-instant"}
+    first = client.post("/appointments", json=body(service_type_id=1,
+                        start_at="2030-01-07T09:00:00+00:00"), headers=key)
+    again = client.post("/appointments", json=body(service_type_id=1,
+                        start_at="2030-01-07T16:00:00+07:00"), headers=key)  # same instant
+    assert first.status_code == again.status_code == 201
+    assert again.json()["id"] == first.json()["id"]
+    assert again.headers["Idempotent-Replayed"] == "true"

@@ -1,3 +1,12 @@
+> **About this document.** This is the implementation plan exactly as it was written *before*
+> any code existed, and then executed task by task, test-first, with one commit per task. It's
+> kept unedited as a record of how the AI agent was directed. Where execution deviated (for
+> example, the plan predicted the wrong PostgreSQL error for an inverted time range, and
+> `/metrics` had to move from a mounted app to a route), the commit messages and the README's
+> AI Collaboration Narrative explain why. Features added after the plan (strict input types,
+> `Idempotency-Key`, the per-vehicle overlap constraint) are documented in
+> [`SYSTEM_DESIGN.md`](SYSTEM_DESIGN.md).
+
 # Unified Service Scheduler Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
