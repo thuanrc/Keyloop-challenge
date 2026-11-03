@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
-
+.gitignore
 # Virtual environments
 .venv
+docs/superpowers/*
