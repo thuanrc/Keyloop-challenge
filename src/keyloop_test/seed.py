@@ -32,3 +32,20 @@ def seed(session: Session) -> None:
             session.add(row)
             session.flush()
     session.commit()  # commit so other sessions (e.g. concurrent bookings) see it
+
+
+def main() -> str:
+    from sqlalchemy import select
+
+    from keyloop_test.db import SessionLocal, engine, init_db
+
+    init_db(engine)
+    with SessionLocal() as session:
+        if session.scalar(select(Dealership.id).limit(1)) is not None:
+            return "already seeded"
+        seed(session)
+    return "seeded"
+
+
+if __name__ == "__main__":
+    print(main())

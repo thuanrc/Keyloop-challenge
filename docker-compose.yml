@@ -14,3 +14,13 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://scheduler:scheduler@db:5432/scheduler
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy

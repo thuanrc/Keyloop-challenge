@@ -56,3 +56,8 @@ def test_json_log_has_request_id(client, seeded):
     assert booked["request_id"] == "t-1" and "appointment_id" in booked
     assert any(line["msg"] == "request" and line["status"] == 201 for line in lines)
     assert "jane" not in buf.getvalue().lower()  # no PII
+
+
+def test_metrics_served_without_redirect(client):
+    r = client.get("/metrics", follow_redirects=False)
+    assert r.status_code == 200 and "appointments_booked_total" in r.text

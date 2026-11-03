@@ -8,12 +8,12 @@ import prometheus_client
 import sqlalchemy.exc
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from keyloop_test.booking import BookingError, BookingRequest, NotFound, book_appointment
-from keyloop_test.db import get_session
+from keyloop_test.db import engine, get_session, init_db
 from keyloop_test.observability import (
     BOOKED, REJECTED, RETRIES, ObservabilityMiddleware, configure_logging,
 )
@@ -27,12 +27,12 @@ log = logging.getLogger("keyloop_test.api")
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     configure_logging()
+    init_db(engine)
     yield
 
 
 app = FastAPI(title="Unified Service Scheduler", version="0.1.0", lifespan=lifespan)
 app.add_middleware(ObservabilityMiddleware)
-app.mount("/metrics", prometheus_client.make_asgi_app())
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
@@ -102,6 +102,11 @@ def list_appointments(
             Appointment.start_at < day_end,
         ).order_by(Appointment.start_at)
     ).all()
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    return Response(prometheus_client.generate_latest(), media_type=prometheus_client.CONTENT_TYPE_LATEST)
 
 
 @app.get("/health/live")
