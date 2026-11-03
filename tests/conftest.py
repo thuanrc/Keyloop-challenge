@@ -34,3 +34,15 @@ def session(engine):
 @pytest.fixture
 def seeded(session):
     seed(session)
+
+
+@pytest.fixture
+def client(session):
+    from fastapi.testclient import TestClient
+
+    from keyloop_test.api import app
+
+    app.dependency_overrides[db.get_session] = lambda: session
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
