@@ -1,7 +1,7 @@
 [project]
 name = "keyloop-test"
 version = "0.1.0"
-description = "Add your description here"
+description = "Service appointment scheduler that books a qualified technician and a service bay without double-booking"
 readme = "README.md"
 authors = [
     { name = "thuanrc", email = "thuanmd01@gmail.com" }
@@ -25,7 +25,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
+    "httpx2>=2.16.0",
     "pytest>=9.2.0",
 ]
 

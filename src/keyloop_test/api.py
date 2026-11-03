@@ -19,7 +19,9 @@ from keyloop_test.observability import (
     BOOKED, REJECTED, RETRIES, ObservabilityMiddleware, configure_logging,
 )
 from keyloop_test.models import Appointment, Dealership
-from keyloop_test.schemas import MAX_DATE, MAX_ID, AppointmentCreate, AppointmentOut
+from keyloop_test.schemas import (
+    MAX_DATE, MAX_ID, AppointmentCreate, AppointmentOut, ErrorResponse,
+)
 
 log = logging.getLogger("keyloop_test.api")
 
@@ -35,6 +37,11 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Unified Service Scheduler", version="0.1.0", lifespan=lifespan)
 app.add_middleware(ObservabilityMiddleware)
 SessionDep = Annotated[Session, Depends(get_session)]
+
+
+def _errors(*codes: int) -> dict:
+    """OpenAPI docs for error responses, so the contract shows the real error shape."""
+    return {code: {"model": ErrorResponse} for code in (*codes, 422, 500, 503)}
 
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
@@ -66,7 +73,8 @@ def _db_unavailable(_: Request, e: Exception):
     return _error(503, "service_unavailable", "Database temporarily unavailable; please retry")
 
 
-@app.post("/appointments", status_code=201, response_model=AppointmentOut)
+@app.post("/appointments", status_code=201, response_model=AppointmentOut,
+          responses=_errors(404, 409))
 def create_appointment(body: AppointmentCreate, session: SessionDep):
     try:
         appointment = book_appointment(session, BookingRequest(**body.model_dump()),
@@ -84,7 +92,8 @@ def create_appointment(body: AppointmentCreate, session: SessionDep):
     return appointment
 
 
-@app.get("/appointments/{appointment_id}", response_model=AppointmentOut)
+@app.get("/appointments/{appointment_id}", response_model=AppointmentOut,
+         responses=_errors(404))
 def get_appointment(appointment_id: Annotated[int, Path(gt=0, le=MAX_ID)], session: SessionDep):
     appointment = session.get(Appointment, appointment_id)
     if appointment is None:
@@ -92,7 +101,7 @@ def get_appointment(appointment_id: Annotated[int, Path(gt=0, le=MAX_ID)], sessi
     return appointment
 
 
-@app.get("/appointments", response_model=list[AppointmentOut])
+@app.get("/appointments", response_model=list[AppointmentOut], responses=_errors(404))
 def list_appointments(
     session: SessionDep,
     dealership_id: Annotated[int, Query(gt=0, le=MAX_ID)],

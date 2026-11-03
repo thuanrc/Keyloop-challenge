@@ -199,7 +199,10 @@ POST /appointments
 | `not_found` | 404 |
 | `validation_error`, `start_in_past`, `outside_business_hours` | 422 |
 | `no_technician_available`, `no_bay_available`, `slot_taken` | 409 |
-| `service_unavailable` (DB pool/lock/statement timeout, DB down) | 503 |
+| `service_unavailable` (DB pool/lock/statement/connect timeout, DB down) | 503 |
+| `internal_error` (unexpected bug; logged with the request id, no internals in the body) | 500 |
+
+Every route documents these responses with the `ErrorResponse` schema in the generated OpenAPI spec.
 
 > **Why no separate `GET /availability` endpoint?** An availability answer is stale the
 > moment it is returned (time-of-check vs time-of-use). The requirement "check before
@@ -291,7 +294,8 @@ request that loses a race usually ends as `no_technician_available` after retryi
   wait up to `pool_timeout` (5 s) and then fail fast with 503 instead of hanging.
 - **Reliability:** correctness is enforced by the DB, not app memory. A request that loses a race
   waits on the winner's row lock until that transaction ends; `lock_timeout=2s` and
-  `statement_timeout=5s` (set per connection) cap that wait. Bounded retries (3) mean no unbounded
+  `statement_timeout=5s` (set per connection) cap that wait, and `connect_timeout=3s` stops an
+  unreachable DB host from hanging new connections (measured: >90 s without it). Bounded retries (3) mean no unbounded
   loops. Health endpoints support orchestration. Future: an `Idempotency-Key` header so that client
   retries after a timeout don't create duplicate bookings.
 - **Maintainability:** layered modules (API → service → models). Pure rule functions are

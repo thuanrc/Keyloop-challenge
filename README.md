@@ -1,5 +1,7 @@
 # Unified Service Scheduler
 
+[![CI](https://github.com/thuanrc/Keyloop-challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/thuanrc/Keyloop-challenge/actions/workflows/ci.yml)
+
 Keyloop technical assessment — **Scenario A**, backend implementation.
 
 A REST API that books a vehicle service appointment only when a **qualified technician** and a
@@ -9,7 +11,9 @@ under concurrent requests.
 
 - System design: [`docs/SYSTEM_DESIGN.md`](docs/SYSTEM_DESIGN.md) (architecture, data flow,
   technology choices, observability, assumptions)
-- API contract: generated OpenAPI at http://localhost:8000/docs once running
+- API contract: generated OpenAPI at http://localhost:8000/docs (`/openapi.json`) once running,
+  including the error responses and their `ErrorResponse` schema
+- CI: every push runs the test suite against PostgreSQL 17 (`.github/workflows/ci.yml`)
 
 ## Prerequisites
 
@@ -89,7 +93,8 @@ curl localhost:8000/metrics | grep appointment
 ```
 
 Error codes: `not_found` 404 · `validation_error`, `start_in_past`, `outside_business_hours` 422 ·
-`no_technician_available`, `no_bay_available`, `slot_taken` 409 · `service_unavailable` 503.
+`no_technician_available`, `no_bay_available`, `slot_taken` 409 · `internal_error` 500 ·
+`service_unavailable` 503. All errors share one shape: `{"error": {"code": ..., "message": ...}}`.
 
 ## Project layout
 

@@ -16,8 +16,11 @@ engine = create_engine(
     max_overflow=10,
     pool_timeout=5,
     pool_pre_ping=True,
-    # cap the wait on a concurrent booking's lock so requests fail fast instead of hanging
-    connect_args={"options": "-c lock_timeout=2000 -c statement_timeout=5000"},
+    # fail fast instead of hanging: unreachable DB host, a concurrent booking's lock, slow queries
+    connect_args={
+        "connect_timeout": 3,
+        "options": "-c lock_timeout=2000 -c statement_timeout=5000",
+    },
 )
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 

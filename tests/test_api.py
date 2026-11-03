@@ -121,3 +121,26 @@ def test_framework_errors_use_error_shape(client):
     assert r.status_code == 404 and error_code(r) == "not_found"
     r = client.delete("/appointments/1")
     assert r.status_code == 405 and error_code(r) == "method_not_allowed"
+
+
+def test_openapi_documents_error_shape(client):
+    spec = client.get("/openapi.json").json()
+    expected = {
+        ("/appointments", "post"): {"404", "409", "422", "500", "503"},
+        ("/appointments/{appointment_id}", "get"): {"404", "422", "500", "503"},
+        ("/appointments", "get"): {"404", "422", "500", "503"},
+    }
+    for (path, method), codes in expected.items():
+        responses = spec["paths"][path][method]["responses"]
+        assert codes <= responses.keys(), (path, method)
+        for code in codes:
+            ref = responses[code]["content"]["application/json"]["schema"]["$ref"]
+            assert ref.endswith("/ErrorResponse"), (path, method, code)
+    assert spec["components"]["schemas"]["ErrorResponse"]["properties"].keys() == {"error"}
+
+
+def test_strict_types_reject_coercion(client, seeded):
+    r = client.post("/appointments", json=body(vehicle_id=True))
+    assert r.status_code == 422 and error_code(r) == "validation_error"
+    r = client.post("/appointments", json=body(start_at=1893920400))  # epoch number
+    assert r.status_code == 422 and error_code(r) == "validation_error"

@@ -1,13 +1,24 @@
 from datetime import UTC, date, datetime
 from typing import Annotated
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_serializer
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_serializer, field_validator
 
 MAX_ID = 2**31 - 1  # Postgres integer
 # far-future bound so date arithmetic can't overflow; business horizons are out of scope
 MAX_START = datetime(9999, 1, 1, tzinfo=UTC)
 MAX_DATE = date(9999, 1, 1)
-DbId = Annotated[int, Field(gt=0, le=MAX_ID)]
+DbId = Annotated[int, Field(gt=0, le=MAX_ID, strict=True)]  # strict: true is not 1
+
+
+class ErrorBody(BaseModel):
+    code: str
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    """The single error shape every non-2xx response uses."""
+
+    error: ErrorBody
 
 
 class AppointmentCreate(BaseModel):
@@ -17,6 +28,13 @@ class AppointmentCreate(BaseModel):
     service_type_id: DbId
     dealership_id: DbId
     start_at: Annotated[AwareDatetime, Field(lt=MAX_START)]
+
+    @field_validator("start_at", mode="before")
+    @classmethod
+    def _iso_string_only(cls, value):
+        if not isinstance(value, str):  # pydantic would read a bare number as epoch seconds
+            raise ValueError("must be an ISO 8601 string with a UTC offset")
+        return value
 
 
 class AppointmentOut(BaseModel):
