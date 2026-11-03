@@ -24,8 +24,11 @@ def seed(session: Session) -> None:
         [ServiceBay(dealership_id=1, name="Bay A"),
          ServiceBay(dealership_id=1, name="Bay B"),
          ServiceBay(dealership_id=2, name="Bay 1")],
-        [Customer(name="Jane Doe", email="jane@example.com")],
-        [Vehicle(customer_id=1, vin="WVWZZZ1JZXW000001", make="VW", model="Golf", year=2021)],
+        [Customer(name="Jane Doe", email="jane@example.com"),
+         Customer(name="John Smith", email="john@example.com")],
+        [Vehicle(customer_id=1, vin="WVWZZZ1JZXW000001", make="VW", model="Golf", year=2021),
+         Vehicle(customer_id=2, vin="JTDBR32E720000002", make="Toyota", model="Corolla", year=2019),
+         Vehicle(customer_id=2, vin="5YJ3E1EA7KF000003", make="Tesla", model="Model 3", year=2023)],
     ]
     for group in groups:
         for row in group:  # one flush per row keeps ids in listed order

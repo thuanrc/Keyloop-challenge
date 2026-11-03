@@ -28,7 +28,7 @@ def test_metrics_count_booking(client, seeded):
     booked = sample("appointments_booked_total")
     rejected = sample("appointment_booking_rejected_total", reason="no_technician_available")
     client.post("/appointments", json=BODY)
-    client.post("/appointments", json=BODY)  # Alice busy → 409
+    client.post("/appointments", json=BODY | {"vehicle_id": 2})  # Alice busy → 409
     assert sample("appointments_booked_total") == booked + 1
     assert sample("appointment_booking_rejected_total",
                   reason="no_technician_available") == rejected + 1

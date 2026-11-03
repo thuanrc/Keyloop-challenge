@@ -50,6 +50,10 @@ class SlotTaken(BookingError):
     code, status = "slot_taken", 409
 
 
+class VehicleAlreadyBooked(BookingError):
+    code, status = "vehicle_already_booked", 409
+
+
 class IdempotencyKeyReused(BookingError):
     code, status = "idempotency_key_reused", 422
 
@@ -118,6 +122,12 @@ def book_appointment(
         check_business_hours(req.start_at, end_at, dealership.timezone,
                              dealership.opens_at, dealership.closes_at)
 
+        vehicle_busy = VehicleAlreadyBooked(
+            f"Vehicle {vehicle.id} already has an appointment overlapping "
+            f"{req.start_at:%Y-%m-%d %H:%M}–{end_at:%H:%M} UTC")
+        if session.scalar(select(_busy(Appointment.vehicle_id, vehicle.id, req.start_at, end_at))):
+            raise vehicle_busy
+
         for _ in range(MAX_ATTEMPTS):
             technician = session.scalars(
                 select(Technician).where(
@@ -153,6 +163,8 @@ def book_appointment(
             except IntegrityError as e:
                 if getattr(e.orig, "sqlstate", None) != "23P01":
                     raise
+                if e.orig.diag.constraint_name == "no_vehicle_overlap":
+                    raise vehicle_busy from None  # the car was booked meanwhile; retrying can't help
                 if on_retry:
                     on_retry()  # lost a race to a concurrent booking; re-query
                 continue

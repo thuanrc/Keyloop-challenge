@@ -10,32 +10,42 @@ def T(h: int, m: int = 0) -> datetime:
     return datetime(2030, 1, 7, h, m, tzinfo=UTC)
 
 
-def _appt(tech, bay, start, end, dealership=1):
+def _appt(tech, bay, start, end, dealership=1, vehicle=1):
     return Appointment(
-        dealership_id=dealership, customer_id=1, vehicle_id=1, service_type_id=1,
+        dealership_id=dealership, customer_id=1, vehicle_id=vehicle, service_type_id=1,
         technician_id=tech, service_bay_id=bay, start_at=start, end_at=end,
     )
 
 
-def _commit_fails(session, sqlstate):
+def _commit_fails(session, sqlstate, constraint=None):
     with pytest.raises(IntegrityError) as e:
         session.commit()
     assert e.value.orig.sqlstate == sqlstate
+    if constraint:
+        assert e.value.orig.diag.constraint_name == constraint
     session.rollback()
 
 
 def test_overlapping_technician_rejected(session, seeded):
     session.add(_appt(1, 1, T(9), T(10)))
     session.commit()
-    session.add(_appt(1, 2, T(9, 30), T(10, 30)))
-    _commit_fails(session, "23P01")
+    session.add(_appt(1, 2, T(9, 30), T(10, 30), vehicle=2))
+    _commit_fails(session, "23P01", "no_technician_overlap")
 
 
 def test_overlapping_bay_rejected(session, seeded):
     session.add(_appt(1, 1, T(9), T(10)))
     session.commit()
-    session.add(_appt(2, 1, T(9, 30), T(10, 30)))
-    _commit_fails(session, "23P01")
+    session.add(_appt(2, 1, T(9, 30), T(10, 30), vehicle=2))
+    _commit_fails(session, "23P01", "no_bay_overlap")
+
+
+def test_overlapping_vehicle_rejected(session, seeded):
+    # different technician and bay: only the car is double-booked
+    session.add(_appt(1, 1, T(9), T(10)))
+    session.commit()
+    session.add(_appt(2, 2, T(9, 30), T(10, 30)))
+    _commit_fails(session, "23P01", "no_vehicle_overlap")
 
 
 def test_back_to_back_allowed(session, seeded):

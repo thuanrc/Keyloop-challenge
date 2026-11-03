@@ -46,7 +46,7 @@ def test_offset_datetime_stored_as_utc(client, seeded):
 
 def test_conflict_409(client, seeded):
     client.post("/appointments", json=body())
-    r = client.post("/appointments", json=body())
+    r = client.post("/appointments", json=body(vehicle_id=2))
     assert r.status_code == 409 and error_code(r) == "no_technician_available"
 
 
@@ -171,3 +171,10 @@ def test_idempotency_key_invalid_422(client, seeded):
 def test_openapi_documents_idempotency_header(client):
     params = client.get("/openapi.json").json()["paths"]["/appointments"]["post"]["parameters"]
     assert any(p["name"] == "Idempotency-Key" and p["in"] == "header" for p in params)
+
+
+def test_retry_without_key_does_not_double_book(client, seeded):
+    oil = body(service_type_id=1)
+    assert client.post("/appointments", json=oil).status_code == 201
+    r = client.post("/appointments", json=oil)  # resent: Bob is free, but it's the same car
+    assert r.status_code == 409 and error_code(r) == "vehicle_already_booked"

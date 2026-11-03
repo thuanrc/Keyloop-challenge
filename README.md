@@ -50,7 +50,7 @@ uv run pytest -v
 | Test file | What it proves |
 |---|---|
 | `test_rules.py` | duration, not-in-past, business hours across time zones and DST (no DB) |
-| `test_constraints.py` | the database itself rejects overlapping bookings, cross-dealership resources and invalid intervals; back-to-back bookings are allowed |
+| `test_constraints.py` | the database itself rejects overlapping technician, bay and vehicle bookings, cross-dealership resources and invalid intervals; back-to-back bookings are allowed |
 | `test_booking.py` | allocation (skill match, fallback, dealership scoping), every error path, retry after a lost race, **two truly concurrent requests → exactly one booking** |
 | `test_idempotency.py` | `Idempotency-Key`: a retry replays without re-booking, key reuse with another body is rejected, a failed attempt doesn't consume the key, **two concurrent same-key requests → one booking** |
 | `test_api.py` | HTTP status codes, error shape, time-zone handling, 503 on DB failure, idempotency header |
@@ -67,18 +67,22 @@ Seed data (ids):
 | Service types | 1 Oil change 60 min `general` · 2 Brake replacement 120 min `brakes` · 3 EV battery check 90 min `ev` |
 | Technicians | 1 Alice `[general, brakes]` (London) · 2 Bob `[general]` (London) · 3 Chen `[ev, general, brakes]` (Hanoi) |
 | Service bays | 1 Bay A, 2 Bay B (London) · 3 Bay 1 (Hanoi) |
-| Customer / vehicle | 1 Jane Doe / 1 VW Golf `WVWZZZ1JZXW000001` |
+| Customers / vehicles | 1 Jane Doe: vehicle 1 VW Golf · 2 John Smith: vehicle 2 Toyota Corolla, vehicle 3 Tesla Model 3 |
 
 ```bash
 # 1. Book a brake job → 201, Alice + Bay A, 09:00–11:00
 curl -X POST localhost:8000/appointments -H 'content-type: application/json' \
   -d '{"vehicle_id":1,"service_type_id":2,"dealership_id":1,"start_at":"2030-01-07T09:00:00+00:00"}'
 
-# 2. Same request again → 409 {"error":{"code":"no_technician_available",...}} (only Alice does brakes)
+# 2. Same request again → 409 vehicle_already_booked (a resent request can't double-book the car)
 
-# 3. Oil change at the same time → 201, falls back to Bob + Bay B
+# 3. Another car wants a brake job at 9 → 409 no_technician_available (only Alice does brakes)
 curl -X POST localhost:8000/appointments -H 'content-type: application/json' \
-  -d '{"vehicle_id":1,"service_type_id":1,"dealership_id":1,"start_at":"2030-01-07T09:00:00+00:00"}'
+  -d '{"vehicle_id":2,"service_type_id":2,"dealership_id":1,"start_at":"2030-01-07T09:00:00+00:00"}'
+
+#    ...but an oil change for that car at 9 → 201, falls back to Bob + Bay B
+curl -X POST localhost:8000/appointments -H 'content-type: application/json' \
+  -d '{"vehicle_id":2,"service_type_id":1,"dealership_id":1,"start_at":"2030-01-07T09:00:00+00:00"}'
 
 # 4. Time without an offset → 422 validation_error ("Input should have timezone info")
 curl -X POST localhost:8000/appointments -H 'content-type: application/json' \
@@ -86,7 +90,7 @@ curl -X POST localhost:8000/appointments -H 'content-type: application/json' \
 
 # 5. Safe retry: send the same request twice with one Idempotency-Key.
 #    The second call returns the SAME appointment (header Idempotent-Replayed: true) instead of
-#    booking again. Without the key, a retry of this oil change would book Bob as well.
+#    booking again. Without the key, the retry would get 409 vehicle_already_booked.
 curl -i -X POST localhost:8000/appointments -H 'content-type: application/json' \
   -H 'Idempotency-Key: 7f3c9a2e-retry-demo' \
   -d '{"vehicle_id":1,"service_type_id":1,"dealership_id":1,"start_at":"2030-01-08T09:00:00+00:00"}'
@@ -102,7 +106,7 @@ curl localhost:8000/metrics | grep appointment
 
 Error codes: `not_found` 404 · `validation_error`, `start_in_past`, `outside_business_hours`,
 `idempotency_key_reused` 422 ·
-`no_technician_available`, `no_bay_available`, `slot_taken` 409 · `internal_error` 500 ·
+`vehicle_already_booked`, `no_technician_available`, `no_bay_available`, `slot_taken` 409 · `internal_error` 500 ·
 `service_unavailable` 503. All errors share one shape: `{"error": {"code": ..., "message": ...}}`.
 
 ## Project layout

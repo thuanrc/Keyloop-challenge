@@ -45,6 +45,8 @@ The brief is ambiguous in places; these are the decisions taken.
     Bay capabilities (e.g. EV lift) are future work and would mirror the technician-skill match.
 12. **Idempotency keys are global and never expire** (there's no auth, so no per-client scoping).
     Clients should use random UUIDs. Only successful bookings are remembered.
+13. **A vehicle can't have two overlapping appointments**, even at different dealerships: one car
+    can't be in two places. Back-to-back appointments for the same car are allowed.
 
 ## 3. Architecture
 
@@ -159,13 +161,15 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 CHECK (end_at > start_at)
 CONSTRAINT no_technician_overlap EXCLUDE USING gist (technician_id WITH =, period WITH &&)
 CONSTRAINT no_bay_overlap        EXCLUDE USING gist (service_bay_id WITH =, period WITH &&)
+CONSTRAINT no_vehicle_overlap    EXCLUDE USING gist (vehicle_id WITH =, period WITH &&)
 -- resources must belong to the appointment's dealership (technicians/service_bays have UNIQUE (id, dealership_id))
 FOREIGN KEY (technician_id, dealership_id)  REFERENCES technicians (id, dealership_id)
 FOREIGN KEY (service_bay_id, dealership_id) REFERENCES service_bays (id, dealership_id)
 ```
 
 The GiST indexes behind these constraints also make the "is this resource busy?" lookups fast.
-Every invariant that can be stated declaratively (no overlap, same dealership, valid interval)
+Every invariant that can be stated declaratively (no overlap per technician, bay or vehicle;
+same dealership; valid interval)
 lives in the database, so a future bug or a second writer can't break it. Rules that need
 context (skill match, business hours, not in the past) live in the booking service.
 
@@ -207,7 +211,7 @@ POST /appointments
 |---|---|
 | `not_found` | 404 |
 | `validation_error`, `start_in_past`, `outside_business_hours`, `idempotency_key_reused` | 422 |
-| `no_technician_available`, `no_bay_available`, `slot_taken` | 409 |
+| `vehicle_already_booked`, `no_technician_available`, `no_bay_available`, `slot_taken` | 409 |
 | `service_unavailable` (DB pool/lock/statement/connect timeout, DB down) | 503 |
 | `internal_error` (unexpected bug; logged with the request id, no internals in the body) | 500 |
 
@@ -218,6 +222,16 @@ Every route documents these responses with the `ErrorResponse` schema in the gen
 **Problem:** a client that times out and resends a booking would otherwise book *again*. The
 first request took Alice, so the retry quietly takes Bob, and one car ends up with two
 appointments at the same time.
+
+**Two layers of protection:**
+
+1. **`no_vehicle_overlap` constraint (always on).** A resent request, with or without a key, can
+   never create a second overlapping appointment for the same car. Without a key, the retry gets
+   `409 vehicle_already_booked`. The service checks this before allocating, so it's the error the
+   client sees. If the car is booked concurrently, it maps the constraint violation to the same
+   error instead of retrying, because a retry can't help.
+2. **`Idempotency-Key` (opt-in).** The retry gets the *original* `201` back, so the client doesn't
+   have to interpret a 409 as "it probably worked the first time".
 
 **Contract:** `POST /appointments` accepts an optional `Idempotency-Key` header (1–255 printable
 ASCII characters, e.g. a UUID).
@@ -364,8 +378,8 @@ request that loses a race usually ends as `no_technician_available` after retryi
 | Layer | What it proves | DB? |
 |---|---|---|
 | Rule unit tests | duration, not-in-past, business hours across timezones and DST | no |
-| Constraint tests | the DB itself rejects overlaps, cross-dealership resources and bad intervals, and allows back-to-back bookings | yes |
-| Service tests | allocation (skill match, fallback, dealership scoping), every error path, retry after a lost race | yes |
+| Constraint tests | the DB itself rejects technician, bay and vehicle overlaps (asserting *which* constraint fired), cross-dealership resources and bad intervals, and allows back-to-back bookings | yes |
+| Service tests | allocation (skill match, fallback, dealership scoping), every error path, retry after a lost race, a lost race on the *vehicle* is not retried | yes |
 | Concurrency test | two truly simultaneous requests for the last slot → exactly one booking | yes |
 | Idempotency tests | same key replays without re-booking, key reuse with another body is rejected, a failed attempt doesn't consume the key, two concurrent same-key requests → one booking | yes |
 | API tests | status codes, error shape, timezone handling, request id, metrics | yes |
@@ -376,7 +390,7 @@ central guarantee is a Postgres feature.
 ## 12. Future Work
 
 Cancellation/rescheduling (add `status`, make constraints partial `WHERE status = 'confirmed'`) ·
-free-slot search endpoint · expiry for idempotency keys (TTL cleanup, e.g. 24 h) · a per-vehicle
-overlap constraint, so even retries *without* a key can't double-book a car · per-day opening hours and holidays · technician
+free-slot search endpoint · expiry for idempotency keys (TTL cleanup, e.g. 24 h) · per-day opening
+hours and holidays · technician
 shifts/breaks · load-balanced allocation · authentication and dealership scoping · OpenTelemetry
 tracing · Alembic migrations (replacing `create_all`).

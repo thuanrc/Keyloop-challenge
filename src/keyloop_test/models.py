@@ -71,6 +71,9 @@ class Appointment(Base):
                           name="no_technician_overlap"),
         ExcludeConstraint(("service_bay_id", "="), ("period", "&&"), using="gist",
                           name="no_bay_overlap"),
+        # one car can't be in two places: also stops a resent request from booking it twice
+        ExcludeConstraint(("vehicle_id", "="), ("period", "&&"), using="gist",
+                          name="no_vehicle_overlap"),
         ForeignKeyConstraint(["technician_id", "dealership_id"],
                              ["technicians.id", "technicians.dealership_id"]),
         ForeignKeyConstraint(["service_bay_id", "dealership_id"],
