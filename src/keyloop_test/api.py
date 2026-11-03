@@ -1,8 +1,10 @@
 import logging
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
+import prometheus_client
 import sqlalchemy.exc
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -12,12 +14,25 @@ from sqlalchemy.orm import Session
 
 from keyloop_test.booking import BookingError, BookingRequest, NotFound, book_appointment
 from keyloop_test.db import get_session
+from keyloop_test.observability import (
+    BOOKED, REJECTED, RETRIES, ObservabilityMiddleware, configure_logging,
+)
 from keyloop_test.models import Appointment, Dealership
 from keyloop_test.schemas import AppointmentCreate, AppointmentOut
 
 log = logging.getLogger("keyloop_test.api")
 
-app = FastAPI(title="Unified Service Scheduler", version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    configure_logging()
+    yield
+
+
+app = FastAPI(title="Unified Service Scheduler", version="0.1.0", lifespan=lifespan)
+app.add_middleware(ObservabilityMiddleware)
+app.mount("/metrics", prometheus_client.make_asgi_app())
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
@@ -46,7 +61,20 @@ def _db_unavailable(_: Request, e: Exception):
 
 @app.post("/appointments", status_code=201, response_model=AppointmentOut)
 def create_appointment(body: AppointmentCreate, session: SessionDep):
-    return book_appointment(session, BookingRequest(**body.model_dump()))
+    try:
+        appointment = book_appointment(session, BookingRequest(**body.model_dump()),
+                                       on_retry=RETRIES.inc)
+    except BookingError as e:
+        REJECTED.labels(e.code).inc()
+        log.info("appointment_rejected", extra={"reason": e.code, **body.model_dump(mode="json")})
+        raise
+    BOOKED.inc()
+    log.info("appointment_booked", extra={
+        "appointment_id": appointment.id, "dealership_id": appointment.dealership_id,
+        "technician_id": appointment.technician_id, "service_bay_id": appointment.service_bay_id,
+        "start_at": appointment.start_at, "end_at": appointment.end_at,
+    })
+    return appointment
 
 
 @app.get("/appointments/{appointment_id}", response_model=AppointmentOut)
