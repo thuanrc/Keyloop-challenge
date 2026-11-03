@@ -1,7 +1,17 @@
 """Booking domain: errors, pure scheduling rules, and the transactional booking service."""
 
-from datetime import datetime, time, timedelta
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime, time, timedelta
 from zoneinfo import ZoneInfo
+
+from sqlalchemy import any_, exists, literal, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from keyloop_test.models import Appointment, Dealership, ServiceBay, ServiceType, Technician, Vehicle
+
+MAX_ATTEMPTS = 3
 
 
 class BookingError(Exception):
@@ -60,3 +70,87 @@ def check_business_hours(
             f"Appointment {local_start:%Y-%m-%d %H:%M}–{local_end:%H:%M} ({tz}) is outside "
             f"business hours {opens_at:%H:%M}–{closes_at:%H:%M}"
         )
+
+
+@dataclass(frozen=True)
+class BookingRequest:
+    vehicle_id: int
+    service_type_id: int
+    dealership_id: int
+    start_at: datetime
+
+
+def _get(session: Session, model, id_: int):
+    row = session.get(model, id_)
+    if row is None:
+        raise NotFound(f"{model.__name__} {id_} not found")
+    return row
+
+
+def _busy(fk_col, resource_id, start_at: datetime, end_at: datetime):
+    """An appointment on this resource overlapping [start_at, end_at)."""
+    return exists().where(fk_col == resource_id, Appointment.start_at < end_at,
+                          Appointment.end_at > start_at)
+
+
+def book_appointment(
+    session: Session,
+    req: BookingRequest,
+    now: datetime | None = None,
+    *,
+    on_retry: Callable[[], None] | None = None,
+) -> Appointment:
+    try:
+        vehicle = _get(session, Vehicle, req.vehicle_id)
+        service_type = _get(session, ServiceType, req.service_type_id)
+        dealership = _get(session, Dealership, req.dealership_id)
+
+        end_at = compute_end(req.start_at, service_type.duration_minutes)
+        check_not_past(req.start_at, now or datetime.now(UTC))
+        check_business_hours(req.start_at, end_at, dealership.timezone,
+                             dealership.opens_at, dealership.closes_at)
+
+        for _ in range(MAX_ATTEMPTS):
+            technician = session.scalars(
+                select(Technician).where(
+                    Technician.dealership_id == req.dealership_id,
+                    literal(service_type.required_skill) == any_(Technician.skills),
+                    ~_busy(Appointment.technician_id, Technician.id, req.start_at, end_at),
+                ).order_by(Technician.id).limit(1)
+            ).first()
+            if technician is None:
+                raise NoTechnicianAvailable(
+                    f"No technician with skill '{service_type.required_skill}' is free "
+                    f"{req.start_at:%Y-%m-%d %H:%M}–{end_at:%H:%M} UTC")
+            bay = session.scalars(
+                select(ServiceBay).where(
+                    ServiceBay.dealership_id == req.dealership_id,
+                    ~_busy(Appointment.service_bay_id, ServiceBay.id, req.start_at, end_at),
+                ).order_by(ServiceBay.id).limit(1)
+            ).first()
+            if bay is None:
+                raise NoBayAvailable(
+                    f"No service bay is free {req.start_at:%Y-%m-%d %H:%M}–{end_at:%H:%M} UTC")
+
+            appointment = Appointment(
+                dealership_id=req.dealership_id, customer_id=vehicle.customer_id,
+                vehicle_id=vehicle.id, service_type_id=service_type.id,
+                technician_id=technician.id, service_bay_id=bay.id,
+                start_at=req.start_at, end_at=end_at,
+            )
+            try:
+                with session.begin_nested():
+                    session.add(appointment)
+                    session.flush()
+            except IntegrityError as e:
+                if getattr(e.orig, "sqlstate", None) != "23P01":
+                    raise
+                if on_retry:
+                    on_retry()  # lost a race to a concurrent booking; re-query
+                continue
+            session.commit()
+            return appointment
+        raise SlotTaken("Resources were taken by a concurrent booking; please retry")
+    except BookingError:
+        session.rollback()
+        raise
